@@ -30,14 +30,25 @@ Press **Ctrl-C** to stop.
 
 ## How it works
 
-Signal Scout reads **RSSI** (received signal strength, in dBm) from your current Wi-Fi connection ~8 times per second and turns it into sound and a live dashboard:
+Signal Scout reads **RSSI** (received signal strength, in dBm) from your current Wi-Fi connection ~8 times per second and turns it into sound and a live color dashboard:
 
 ```text
-Locked: AA:BB:CC:DD:EE:FF  (MyNetwork)   log: logs/scout-20260612-181203.csv
- -52 dBm  avg -54.1  peak -41   ████████████████··········
- ▲ HOTTER
- ▂▂▃▃▄▅▅▆▆▇▇▆▅▅▄▄▅▆▇█▇▇▆▅▄▃▂▂▃▄▅▆▇█  (-85 … -38 dBm, last ~30s)
+ Locked: aa:bb:cc:dd:ee:ff  (MyNetwork)   elapsed 02:14 · 1052 readings
+ now -52 dBm   avg -54.1   peak -41   low -78   ~14.2 clicks/s
+ far ▕████████████████··········▏near   ▲ HOTTER +2.3 dB
+
+ -50 ┤                                      ▂▄█
+     │                                  ▁▄▆█████
+ -54 ┤                          ▂▄▅▆▇███████████
+     │                  ▁▃▅▆████████████████████
+ -57 ┤          ▂▄▆█████████████████████████████
+     │██████████████████████████████████████████
+     └──────────────────────────────────────────
+      -32s                                   now
+ log: logs/scout-20260612-183738.csv  ·  Ctrl-C to stop
 ```
+
+The history chart auto-scales to the data it's showing (with dBm axis labels), so even small signal changes are visible, and every column is heat-colored from blue (far) through green and yellow to red (near).
 
 ### BSSID lock
 
@@ -59,7 +70,7 @@ The click rate, bar, and trend are driven by a ~1.5 s rolling average rather tha
 
 ### History graph
 
-The bottom line is a sparkline of the last ~30 seconds of averaged signal, scaled between -85 and -38 dBm, so you can see the shape of your approach at a glance.
+The chart plots the last ~30 seconds of averaged signal as a heat-colored column graph. It auto-scales its dBm axis to the visible data (minimum 4 dB span), so a slow climb from -72 to -68 fills the chart instead of disappearing into a flat line on a fixed -85…-38 scale.
 
 ### CSV logs
 

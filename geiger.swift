@@ -22,12 +22,13 @@ let pollSleep: useconds_t = 120_000  // ~8 RSSI reads/sec
 let uiSleep: useconds_t = 250_000    // 4 dashboard redraws/sec
 let avgWindow = 12         // rolling-average window (~1.5 s at 8 Hz)
 let trendWindow = 24       // samples kept for the trend comparison (~3 s)
-let historyCapacity = 120  // averaged samples in the graph (~30 s at 4 Hz)
+let historyCapacity = 120  // averaged history samples kept (~60 s at 2 Hz)
 let trendThreshold = 1.0   // dB of average movement that counts as a real move
 
 // --- ANSI helpers ------------------------------------------------------------
 let esc = "\u{001B}"
 let red = "\(esc)[31m", blue = "\(esc)[34m", yellow = "\(esc)[33m"
+let green = "\(esc)[32m", cyan = "\(esc)[36m"
 let bold = "\(esc)[1m", dim = "\(esc)[2m", reset = "\(esc)[0m"
 
 // --- Rolling buffers ---------------------------------------------------------
@@ -63,7 +64,10 @@ struct Snapshot {
     var rssi: Int
     var avg: Double?
     var trend: Trend
+    var trendDelta: Double?
     var peak: Int
+    var low: Int
+    var readings: Int
     var ssid: String
     var lockedBSSID: String?
     var currentBSSID: String?
@@ -84,6 +88,8 @@ final class State {
     private var roamed = false
     private var ssidOnlyMode = false
     private var peak = -200
+    private var low = 0   // 0 == no reading yet
+    private var readings = 0
 
     func update(rssi newRSSI: Int, ssid newSSID: String?, bssid newBSSID: String?) -> [WifiEvent] {
         lock.lock(); defer { lock.unlock() }
@@ -117,6 +123,8 @@ final class State {
         // While roamed we're reading a different AP — don't pollute the data.
         if !roamed {
             samples.append(Double(newRSSI))
+            readings += 1
+            if low == 0 || newRSSI < low { low = newRSSI }
             if newRSSI > peak {
                 peak = newRSSI
                 events.append(.newPeak(newRSSI))
@@ -136,15 +144,18 @@ final class State {
         lock.lock(); defer { lock.unlock() }
         let avg = samples.mean(last: avgWindow)
         var trend = Trend.unknown
+        var trendDelta: Double?
         if samples.isFull,
            let now = samples.mean(last: avgWindow),
            let past = samples.mean(first: trendWindow - avgWindow) {
             let d = now - past
+            trendDelta = d
             if d > trendThreshold { trend = .hotter }
             else if d < -trendThreshold { trend = .colder }
             else { trend = .steady }
         }
-        return Snapshot(rssi: rssi, avg: avg, trend: trend, peak: peak, ssid: ssid,
+        return Snapshot(rssi: rssi, avg: avg, trend: trend, trendDelta: trendDelta,
+                        peak: peak, low: low, readings: readings, ssid: ssid,
                         lockedBSSID: lockedBSSID, currentBSSID: currentBSSID,
                         roamed: roamed, ssidOnlyMode: ssidOnlyMode, history: history.values)
     }
@@ -272,19 +283,80 @@ DispatchQueue.global(qos: .userInteractive).async {
 }
 
 // --- Dashboard rendering -------------------------------------------------------
+let graphRows = 6      // chart height in terminal rows
+let graphWidth = 64    // chart width in columns (one history sample per column)
+let historyEvery = 2   // record a history sample every Nth UI tick (2 Hz)
+let startDate = Date()
+
+// Heat color on the absolute far↔near scale: blue = far/cold … red = near/hot.
+func heatColor(_ rssi: Double) -> String {
+    let t = max(0.0, min(1.0, (rssi - farRSSI) / (nearRSSI - farRSSI)))
+    switch t {
+    case ..<0.2: return blue
+    case ..<0.4: return cyan
+    case ..<0.6: return green
+    case ..<0.8: return yellow
+    default:     return red
+    }
+}
+
 func bar(forAvg avg: Double, width: Int = 26) -> String {
     let pct = max(0.0, min(1.0, (avg - farRSSI) / (nearRSSI - farRSSI)))
     let filled = Int((Double(width) * pct).rounded())
-    return String(repeating: "█", count: filled) + String(repeating: "·", count: width - filled)
+    return heatColor(avg) + String(repeating: "█", count: filled) + reset
+        + dim + String(repeating: "·", count: width - filled) + reset
 }
 
-let sparkChars: [Character] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
-func sparkline(_ values: [Double]) -> String {
-    String(values.map { v -> Character in
-        let t = max(0.0, min(1.0, (v - farRSSI) / (nearRSSI - farRSSI)))
-        let idx = min(sparkChars.count - 1, Int(t * Double(sparkChars.count)))
-        return sparkChars[idx]
-    })
+let blockChars: [Character] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+
+// Multi-row column chart, auto-scaled to the visible data (with a minimum
+// 4 dB span) so small wobbles around a steady signal are actually visible.
+// Always returns graphRows + 2 lines (chart, x-axis, time labels).
+func graphLines(_ values: [Double]) -> [String] {
+    let axisPrefix = "     │", axisCorner = "     └"
+    let shown = Array(values.suffix(graphWidth))
+    guard !shown.isEmpty else {
+        var lines = Array(repeating: axisPrefix, count: graphRows)
+        lines[graphRows / 2] += dim + "  (signal history will appear here)" + reset
+        lines.append(axisCorner + String(repeating: "─", count: graphWidth))
+        lines.append("      " + dim + "waiting for data…" + reset)
+        return lines
+    }
+
+    var lo = shown.min()!, hi = shown.max()!
+    if hi - lo < 4 {                      // enforce a minimum span
+        let mid = (hi + lo) / 2
+        lo = mid - 2; hi = mid + 2
+    }
+    let pad = (hi - lo) * 0.10
+    let gLo = lo - pad, gHi = hi + pad
+
+    var lines: [String] = []
+    for r in 0..<graphRows {
+        let rowTop = Double(graphRows - r)       // row edges, in row units from the bottom
+        let rowBottom = rowTop - 1
+        let labelValue = gHi - (Double(r) + 0.5) / Double(graphRows) * (gHi - gLo)
+        var line = r % 2 == 0 ? String(format: "%4.0f ┤", labelValue) : axisPrefix
+        for v in shown {
+            let h = (v - gLo) / (gHi - gLo) * Double(graphRows)
+            if h >= rowTop {
+                line += heatColor(v) + "█" + reset
+            } else if h > rowBottom {
+                let idx = min(blockChars.count - 1, Int((h - rowBottom) * 8))
+                line += heatColor(v) + String(blockChars[idx]) + reset
+            } else {
+                line += " "
+            }
+        }
+        lines.append(line)
+    }
+    lines.append(axisCorner + String(repeating: "─", count: graphWidth))
+
+    let span = Double(shown.count) * Double(uiSleep) / 1_000_000 * Double(historyEvery)
+    let leftLabel = String(format: "-%.0fs", span)
+    let gap = max(1, graphWidth - leftLabel.count - 3)
+    lines.append("      " + dim + leftLabel + String(repeating: " ", count: gap) + "now" + reset)
+    return lines
 }
 
 var firstDraw = true
@@ -298,53 +370,58 @@ func render(_ lines: [String]) {
 print("\(esc)[?25l", terminator: "")
 print("Signal Scout — Wi-Fi Geiger counter.  Get closer = faster clicks.  Ctrl-C to stop.\n")
 
+var tick = 0
 while keepGoing {
-    state.recordHistory()
+    if tick % historyEvery == 0 { state.recordHistory() }
+    tick += 1
     let s = state.snapshot
-    let logNote = dim + "log: \(logger?.path ?? "—")" + reset
+
+    let elapsed = Int(Date().timeIntervalSince(startDate))
+    let clock = String(format: "%02d:%02d", elapsed / 60, elapsed % 60)
+    let sessionNote = dim + "elapsed \(clock) · \(s.readings) readings" + reset
 
     let header: String
     if let target = s.lockedBSSID {
-        header = "Locked: \(bold)\(target)\(reset)  (\(s.ssid))   \(logNote)"
+        header = " Locked: \(bold)\(target)\(reset)  (\(s.ssid))   \(sessionNote)"
     } else if s.ssidOnlyMode {
-        header = yellow + "SSID-only mode — grant Location Services to lock the BSSID" + reset
-            + "  (\(s.ssid))   \(logNote)"
+        header = " " + yellow + "SSID-only mode — grant Location Services to lock the BSSID" + reset
+            + "   \(sessionNote)"
     } else {
-        header = dim + "Waiting for Wi-Fi connection…" + reset + "   \(logNote)"
+        header = " " + dim + "Waiting for Wi-Fi connection…" + reset + "   \(sessionNote)"
     }
 
     let readout: String
-    let status: String
+    let barLine: String
     if s.rssi == 0 {
-        readout = dim + "[not connected]  join the target network…" + reset
-        status = " "
+        readout = " " + dim + "[not connected]  join the target network…" + reset
+        barLine = " "
     } else {
         let avgText = s.avg.map { String(format: "%.1f", $0) } ?? "—"
-        readout = String(format: "%4d dBm  avg %@  peak %d   %@",
-                         s.rssi, avgText, s.peak, bar(forAvg: s.avg ?? Double(s.rssi)))
+        let lowText = s.low < 0 ? "\(s.low)" : "—"
+        let rateText = s.avg.map { String(format: "%.1f", clickRate(forAvg: $0)) } ?? "—"
+        readout = " now " + heatColor(Double(s.rssi)) + bold + "\(s.rssi) dBm" + reset
+            + "   avg \(avgText)   peak \(s.peak)   low \(lowText)   "
+            + dim + "~\(rateText) clicks/s" + reset
+
+        let status: String
         if s.roamed {
             status = red + bold + "⚠ ROAMED" + reset + red
-                + " — now on \(s.currentBSSID ?? "?"), clicks paused (restart to re-lock)" + reset
+                + " — on \(s.currentBSSID ?? "?"), clicks paused" + reset
         } else {
+            let deltaText = s.trendDelta.map { String(format: " %+.1f dB", $0) } ?? ""
             switch s.trend {
-            case .hotter:  status = red + bold + "▲ HOTTER" + reset
-            case .colder:  status = blue + bold + "▼ COLDER" + reset
-            case .steady:  status = dim + "· steady" + reset
+            case .hotter:  status = red + bold + "▲ HOTTER" + reset + red + deltaText + reset
+            case .colder:  status = blue + bold + "▼ COLDER" + reset + blue + deltaText + reset
+            case .steady:  status = dim + "· steady" + deltaText + reset
             case .unknown: status = dim + "… gathering signal" + reset
             }
         }
+        barLine = " far ▕" + bar(forAvg: s.avg ?? Double(s.rssi)) + "▏near   " + status
     }
 
-    let graph: String
-    if s.history.isEmpty {
-        graph = dim + "(history graph will appear here)" + reset
-    } else {
-        let span = Double(s.history.count) * Double(uiSleep) / 1_000_000
-        graph = sparkline(s.history) + dim
-            + String(format: "  (%.0f … %.0f dBm, last ~%.0fs)", farRSSI, nearRSSI, span) + reset
-    }
+    let footer = " " + dim + "log: \(logger?.path ?? "—")  ·  Ctrl-C to stop" + reset
 
-    render([header, readout, status, graph])
+    render([header, readout, barLine, ""] + graphLines(s.history) + [footer])
     usleep(uiSleep)
 }
 
